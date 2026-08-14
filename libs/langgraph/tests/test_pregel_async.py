@@ -9390,6 +9390,56 @@ async def test_null_resume_disallowed_with_multiple_interrupts(
     }
 
 
+async def test_scalar_resume_rejected_for_nested_parallel_interrupts() -> None:
+    class State(TypedDict):
+        answers: Annotated[list[str], operator.add]
+
+    async def ask_left(state: State) -> State:
+        return {"answers": [f"left={interrupt('left')}"]}
+
+    async def ask_right(state: State) -> State:
+        return {"answers": [f"right={interrupt('right')}"]}
+
+    child = (
+        StateGraph(State)
+        .add_node("ask_left", ask_left)
+        .add_node("ask_right", ask_right)
+        .add_edge(START, "ask_left")
+        .add_edge(START, "ask_right")
+        .compile()
+    )
+    graph = (
+        StateGraph(State)
+        .add_node("child", child)
+        .add_edge(START, "child")
+        .compile(checkpointer=InMemorySaver())
+    )
+    config: RunnableConfig = {
+        "configurable": {"thread_id": "nested-parallel-interrupts-async"}
+    }
+
+    result = await graph.ainvoke({"answers": []}, config=config)
+    assert len(result["__interrupt__"]) == 2
+
+    with pytest.raises(
+        RuntimeError,
+        match="When there are multiple pending interrupts, you must specify the interrupt id when resuming.",
+    ):
+        await graph.ainvoke(Command(resume="ambiguous"), config=config)
+
+    state = await graph.aget_state(config)
+    interrupts = {i.value: i.id for i in state.interrupts}
+    result = await graph.ainvoke(
+        Command(resume={interrupts["left"]: "answer-left"}), config=config
+    )
+    assert [i.value for i in result["__interrupt__"]] == ["right"]
+
+    result = await graph.ainvoke(
+        Command(resume={interrupts["right"]: "answer-right"}), config=config
+    )
+    assert set(result["answers"]) == {"left=answer-left", "right=answer-right"}
+
+
 async def test_astream_waiter_cleanup_on_cancel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
